@@ -15,7 +15,7 @@ from metrics import calculate_metrics_and_loss
 
 # --- 1. 配置参数 ---
 # !! 修改为你自己的路径 !!
-DATA_PATH = r"D:\对照试验模型\dataset\9-isic2018"
+DATA_PATH = r"D:\controller\dataset\9-isic2018"
 
 # 超参数
 LEARNING_RATE = 0.0003
@@ -27,7 +27,7 @@ IMAGE_HEIGHT = 256
 IMAGE_WIDTH = 256
 PIN_MEMORY = True
 NUM_CLASSES = 1  # <-- 修改点: 二分类 (BCE) 模式下, 输出通道为 1
-SAVE_PATH = "D-Mixer+CConv"
+SAVE_PATH = "LCA+CConv"
 early_stop_patience = 20
 early_stop_counter = 0
 stage_channels = [16, 32, 64, 96, 160]
