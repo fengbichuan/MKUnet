@@ -161,21 +161,22 @@ class CosinConv2D(nn.Conv2d):
 
 
 # ===================================================================
-# ===== 2. 引入的新模块 (来自 8、PConv(AAAI2025).py) ==================
+# ===== 2. 引入的新模块 (SID-Lite 和 CDFA) ============================
 # ===================================================================
 
-# CBR模块：卷积 -> 批归一化 -> 可选ReLU激活
-class Dilated_CBR(nn.Module):
+# --- 2a. SID_Lite 模块 (来自 7、AMS（AAAI 2025）.py 的精简版) ---
+
+class SID_CBR(nn.Module):
+    """ SID-Lite 依赖的 CBR 模块 """
+
     def __init__(self, in_c, out_c, kernel_size=3, padding=1, dilation=1, stride=1, act=True):
         super().__init__()
-        self.act = act  # 控制是否激活
-        # 构建卷积和归一化组合层
+        self.act = act  # 标志是否应用激活函数
         self.conv = nn.Sequential(
-            nn.Conv2d(in_c, out_c, kernel_size, stride=stride, padding=padding, dilation=dilation, bias=False),
+            nn.Conv2d(in_c, out_c, kernel_size, stride, padding, dilation=dilation, bias=False),
             nn.BatchNorm2d(out_c)
         )
-        self.relu = nn.ReLU(inplace=True)  # 使用ReLU激活函数
-        # ai缝合大王
+        self.relu = nn.ReLU(inplace=True)  # 使用ReLU增加非线性
 
     def forward(self, x):
         x = self.conv(x)
@@ -184,83 +185,166 @@ class Dilated_CBR(nn.Module):
         return x
 
 
-# 通道注意力模块：结合全局平均和最大池化，生成通道权重
-class Dilated_channel_attention(nn.Module):
-    def __init__(self, in_planes, ratio=16):
-        super(Dilated_channel_attention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # 全局平均池化
-        self.max_pool = nn.AdaptiveMaxPool2d(1)  # 全局最大池化
+class SID_Lite(nn.Module):
+    """
+    Semantic_Information_Decoupling (精简版)
+    仅保留特征解耦分支，移除了大型上采样辅助分支以节省参数。
+    """
 
-        # --- START FIX ---
-        # 确保缩减后的通道数至少为 1
-        reduced_channels = max(1, in_planes // ratio)
-        # --- END FIX ---
-
-        self.fc1 = nn.Conv2d(in_planes, reduced_channels, kernel_size=1, bias=False)  # 通道降维
-        self.relu1 = nn.ReLU()  # 激活
-        self.fc2 = nn.Conv2d(reduced_channels, in_planes, kernel_size=1, bias=False)  # 通道升维
-
-        self.sigmoid = nn.Sigmoid()  # 映射到 [0, 1]
-
-    def forward(self, x):
-        x_orig = x  # 保留原始输入
-        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
-        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
-        out = avg_out + max_out
-        return x_orig * self.sigmoid(out)
-
-
-# 空间注意力模块：利用通道统计生成空间权重图
-class Dilated_spatial_attention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(Dilated_spatial_attention, self).__init__()
-        # 核尺寸必须为3或7
-        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
-        padding = 3 if kernel_size == 7 else 1
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()  # 将卷积输出映射至 [0,1]
-        # ai缝合大王
-
-    def forward(self, x):
-        x_orig = x  # 保存原始特征
-        avg_out = torch.mean(x, dim=1, keepdim=True)  # 对通道取平均
-        max_out, _ = torch.max(x, dim=1, keepdim=True)  # 对通道取最大值
-        x_cat = torch.cat([avg_out, max_out], dim=1)
-        x_conv = self.conv1(x_cat)
-        return x_orig * self.sigmoid(x_conv)
-
-
-# 膨胀卷积模块：采用不同膨胀率的卷积以捕捉多尺度上下文信息，并通过注意力机制进行特征重构
-class Dilated_conv_Module(nn.Module):
     def __init__(self, in_c, out_c):
-        super().__init__()
-        self.relu = nn.ReLU(inplace=True)
-        # 每个分支先用CBR模块做卷积，再结合通道注意力
-        self.c1 = nn.Sequential(Dilated_CBR(in_c, out_c, kernel_size=1, padding=0), Dilated_channel_attention(out_c))
-        self.c2 = nn.Sequential(Dilated_CBR(in_c, out_c, kernel_size=3, padding=6, dilation=6),
-                                Dilated_channel_attention(out_c))
-        self.c3 = nn.Sequential(Dilated_CBR(in_c, out_c, kernel_size=3, padding=12, dilation=12),
-                                Dilated_channel_attention(out_c))
-        self.c4 = nn.Sequential(Dilated_CBR(in_c, out_c, kernel_size=3, padding=18, dilation=18),
-                                Dilated_channel_attention(out_c))
-        # 合并分支后使用3x3卷积整合多尺度信息
-        self.c5 = Dilated_CBR(out_c * 4, out_c, kernel_size=3, padding=1, act=False)
-        # 直接1x1卷积对输入进行映射
-        self.c6 = Dilated_CBR(in_c, out_c, kernel_size=1, padding=0, act=False)
-        self.sa = Dilated_spatial_attention()  # 空间注意力模块
+        super(SID_Lite, self).__init__()
+        # 前景特征提取分支
+        self.cbr_fg = nn.Sequential(
+            SID_CBR(in_c, in_c // 2, kernel_size=3, padding=1),
+            SID_CBR(in_c // 2, out_c, kernel_size=3, padding=1),
+        )
+        # 背景特征提取分支
+        self.cbr_bg = nn.Sequential(
+            SID_CBR(in_c, in_c // 2, kernel_size=3, padding=1),
+            SID_CBR(in_c // 2, out_c, kernel_size=3, padding=1),
+        )
 
     def forward(self, x):
-        x1 = self.c1(x)
-        x2 = self.c2(x)
-        x3 = self.c3(x)
-        x4 = self.c4(x)
-        # 将四个分支输出在通道维度上拼接
-        xc = torch.cat([x1, x2, x3, x4], axis=1)
-        xc = self.c5(xc)
-        xs = self.c6(x)
-        x_out = self.relu(xc + xs)  # 残差连接和激活
-        x_out = self.sa(x_out)  # 空间注意力加权
-        return x_out
+        # 提取前景、背景特征
+        f_fg = self.cbr_fg(x)
+        f_bg = self.cbr_bg(x)
+        return f_fg, f_bg
+
+
+# --- 2b. CDFA 模块 (来自 5、CDFA (AAAI 2025).py) ---
+
+class CDFA_CBR(nn.Module):
+    """ CDFA 依赖的 CBR 模块 """
+
+    def __init__(self, in_c, out_c, kernel_size=3, padding=1):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_c, out_c, kernel_size, stride=1, padding=padding, bias=False),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class ContrastDrivenFeatureAggregation(nn.Module):
+    """
+    来自 5、CDFA (AAAI 2025).py
+    - x: 必须有 in_c 个通道
+    - fg, bg: 必须有 out_c 个通道
+    """
+
+    def __init__(self, in_c, out_c, num_heads=4, kernel_size=3, padding=1, stride=1, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        dim = out_c  # 模块的 "工作维度"
+        self.dim = dim
+        self.in_c = in_c
+        self.out_c = out_c
+
+        self.num_heads = num_heads
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.stride = stride
+        # 确保 head_dim 至少为 1
+        self.head_dim = max(1, dim // num_heads)
+
+        # (FIX for potential num_heads > dim) 确保 inner_dim 正确
+        self.inner_dim = self.head_dim * self.num_heads
+
+        self.scale = self.head_dim ** -0.5
+
+        # 线性变换层，用于生成值特征
+        self.v = nn.Linear(dim, self.inner_dim)  # v 映射到 inner_dim
+        # 两个线性层分别生成前景和背景的注意力权重
+        self.attn_fg = nn.Linear(dim, kernel_size ** 4 * self.num_heads)
+        self.attn_bg = nn.Linear(dim, kernel_size ** 4 * self.num_heads)
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        # 输出投影层
+        self.proj = nn.Linear(self.inner_dim, dim)  # 从 inner_dim 映射回 dim
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.unfold = nn.Unfold(kernel_size=kernel_size, padding=padding, stride=stride)
+        self.pool = nn.AvgPool2d(kernel_size=stride, stride=stride, ceil_mode=True)
+
+        # 预处理模块：将 in_c 映射到 dim (out_c)
+        self.input_cbr = nn.Sequential(
+            CDFA_CBR(in_c, dim, kernel_size=3, padding=1),
+            CDFA_CBR(dim, dim, kernel_size=3, padding=1),
+        )
+        # 后处理模块：
+        self.output_cbr = nn.Sequential(
+            CDFA_CBR(dim, dim, kernel_size=3, padding=1),
+            CDFA_CBR(dim, dim, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x, fg, bg):
+        # x (B, in_c, H, W) -> (B, dim, H, W)
+        x = self.input_cbr(x)
+
+        # fg, bg 已经是 (B, dim, H, W)
+
+        # 将输入转换为 (B, H, W, C) 格式
+        x = x.permute(0, 2, 3, 1)
+        fg = fg.permute(0, 2, 3, 1)
+        bg = bg.permute(0, 2, 3, 1)
+
+        B, H, W, C = x.shape
+        assert C == self.dim, f"Input x has {C} channels, but expected dim={self.dim}"
+
+        v = self.v(x).permute(0, 3, 1, 2)  # (B, inner_dim, H, W)
+        v_unfolded = self.unfold(v).reshape(B, self.num_heads, self.head_dim, self.kernel_size * self.kernel_size,
+                                            -1).permute(0, 1, 4, 3, 2)
+
+        attn_fg = self.compute_attention(fg, B, H, W, C, 'fg')
+        x_weighted_fg = self.apply_attention(attn_fg, v_unfolded, B, H, W, C)  # (B, H, W, inner_dim)
+
+        v_unfolded_bg = self.unfold(x_weighted_fg.permute(0, 3, 1, 2)).reshape(B, self.num_heads, self.head_dim,
+                                                                               self.kernel_size * self.kernel_size,
+                                                                               -1).permute(0, 1, 4, 3, 2)
+        attn_bg = self.compute_attention(bg, B, H, W, C, 'bg')
+        x_weighted_bg = self.apply_attention(attn_bg, v_unfolded_bg, B, H, W, C)  # (B, H, W, inner_dim)
+
+        # Proj
+        x_projected = self.proj(x_weighted_bg)
+        x_projected = self.proj_drop(x_projected)  # (B, H, W, dim)
+        x_projected = x_projected.permute(0, 3, 1, 2)  # (B, dim, H, W)
+
+        out = self.output_cbr(x_projected)
+        return out
+
+    def compute_attention(self, feature_map, B, H, W, C, feature_type):
+        attn_layer = self.attn_fg if feature_type == 'fg' else self.attn_bg
+        h, w = math.ceil(H / self.stride), math.ceil(W / self.stride)
+
+        # feature_map (fg/bg) 已经是 (B, H, W, C=dim)
+        feature_map_pooled = self.pool(feature_map.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+
+        attn = attn_layer(feature_map_pooled).reshape(B, h * w, self.num_heads,
+                                                      self.kernel_size * self.kernel_size,
+                                                      self.kernel_size * self.kernel_size).permute(0, 2, 1, 3, 4)
+        attn = attn * self.scale
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+        return attn
+
+    def apply_attention(self, attn, v, B, H, W, C):
+        # attn (B, num_heads, L, K*K, K*K)
+        # v (B, num_heads, L, K*K, head_dim)
+        x_weighted = (attn @ v)  # (B, num_heads, L, K*K, head_dim)
+
+        # (B, num_heads, L, K*K, head_dim) -> (B, num_heads, head_dim, K*K, L) -> (B, inner_dim * K*K, L)
+        x_weighted = x_weighted.permute(0, 1, 4, 3, 2).reshape(B, self.inner_dim * self.kernel_size * self.kernel_size,
+                                                               -1)
+
+        # Fold
+        x_weighted = F.fold(x_weighted, output_size=(H, W), kernel_size=self.kernel_size, padding=self.padding,
+                            stride=self.stride)
+
+        # (B, inner_dim, H, W) -> (B, H, W, inner_dim)
+        x_weighted = x_weighted.permute(0, 2, 3, 1)
+        return x_weighted
 
 
 # ===================================================================
@@ -353,9 +437,13 @@ class ChannelAttention(nn.Module):
         super(ChannelAttention, self).__init__()
         self.in_planes = in_planes
         self.out_planes = out_planes
+
+        # 确保 reduced_channels 至少为 1
         if self.in_planes < ratio:
-            ratio = self.in_planes
-        self.reduced_channels = self.in_planes // ratio
+            self.reduced_channels = 1
+        else:
+            self.reduced_channels = self.in_planes // ratio
+
         if self.out_planes == None:
             self.out_planes = in_planes
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -418,92 +506,83 @@ class SpatialAttention(nn.Module):
         return self.sigmoid(x)
 
 
-class GroupedAttentionGate(nn.Module):
-    def __init__(self, F_g, F_l, F_int, kernel_size=1, groups=1, activation='relu'):
-        super(GroupedAttentionGate, self).__init__()
-        if kernel_size == 1:
-            groups = 1
+# ----- (已移除 GroupedAttentionGate, 它将被 CDFA 替换) -----
 
-        self.W_g = nn.Sequential(
-            nn.Conv2d(F_g, F_int, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, groups=groups,
-                      bias=True),
-            nn.BatchNorm2d(F_int)
-        )
 
-        self.W_x = nn.Sequential(
-            nn.Conv2d(F_l, F_int, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, groups=groups,
-                      bias=True),
-            nn.BatchNorm2d(F_int)
-        )
+class MultiKernelDepthwiseConv(nn.Module):
+    """ 您的原始 MultiKernelDepthwiseConv 模块 (已恢复) """
 
-        self.psi = nn.Sequential(
-            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm2d(1),
-            nn.Sigmoid()
-        )
-
-        self.activation = act_layer(activation, inplace=True)
-
+    def __init__(self, in_channels, kernel_sizes, stride, activation='relu6', dw_parallel=True):
+        super(MultiKernelDepthwiseConv, self).__init__()
+        self.in_channels = in_channels
+        self.dw_parallel = dw_parallel
+        self.dwconvs = nn.ModuleList([
+            nn.Sequential(
+                # <-- MODIFIED: 使用 CosinConv2D -->
+                CosinConv2D(
+                    in_channels=self.in_channels,
+                    out_channels=self.in_channels,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    padding=kernel_size // 2,
+                    groups=self.in_channels
+                ),
+                nn.BatchNorm2d(self.in_channels),
+                act_layer(activation, inplace=True)
+            )
+            for kernel_size in kernel_sizes
+        ])
         self.init_weights('normal')
 
     def init_weights(self, scheme=''):
         named_apply(partial(_init_weights, scheme=scheme), self)
 
-    def forward(self, g, x):
-        g1 = self.W_g(g)
-        x1 = self.W_x(x)
-        psi = self.activation(g1 + x1)
-        psi = self.psi(psi)
-
-        return x * psi
-
-
-# ----- (已移除 MultiKernelDepthwiseConv) -----
+    def forward(self, x):
+        outputs = []
+        for dwconv in self.dwconvs:
+            dw_out = dwconv(x)
+            outputs.append(dw_out)
+            if self.dw_parallel == False:
+                x = x + dw_out
+        return outputs
 
 
 class MultiKernelInvertedResidualBlock(nn.Module):
-    """
-    inverted residual block used in MobileNetV2
-    (MODIFIED: 使用 Dilated_conv_Module 替换 MultiKernelDepthwiseConv)
-    """
+    """ 您的原始 MultiKernelInvertedResidualBlock 模块 (已恢复) """
 
-    def __init__(self, in_c, out_c, stride, expansion_factor=2, activation='relu6'):
+    def __init__(self, in_c, out_c, stride, expansion_factor=2, dw_parallel=True, add=True, kernel_sizes=[1, 3, 5],
+                 activation='relu6'):
         super(MultiKernelInvertedResidualBlock, self).__init__()
-        # check stride value
         assert stride in [1, 2]
         self.stride = stride
         self.in_c = in_c
         self.out_c = out_c
-        # Skip connection if stride is 1
+        self.kernel_sizes = kernel_sizes
+        self.add = add
+        self.n_scales = len(kernel_sizes)
         self.use_skip_connection = True if self.stride == 1 else False
 
-        # expansion factor or t as mentioned in the paper
         self.ex_c = int(self.in_c * expansion_factor)
 
-        # 1x1 逐点卷积
         self.pconv1 = nn.Sequential(
-            # pointwise convolution
             nn.Conv2d(self.in_c, self.ex_c, 1, 1, 0, bias=False),
             nn.BatchNorm2d(self.ex_c),
             act_layer(activation, inplace=True)
         )
 
-        # <-- MODIFIED: 使用新的多尺度（膨胀）模块 -->
-        self.multi_scale_dwconv = nn.Sequential(
-            Dilated_conv_Module(self.ex_c, self.ex_c),
-            nn.BatchNorm2d(self.ex_c),  # 添加 BN + Act 以匹配原始 DWConv 块
-            act_layer(activation, inplace=True)
-        )
+        self.multi_scale_dwconv = MultiKernelDepthwiseConv(self.ex_c, self.kernel_sizes, self.stride, activation,
+                                                           dw_parallel=dw_parallel)
 
-        # 1x1 逐点卷积
+        if self.add == True:
+            self.combined_channels = self.ex_c * 1
+        else:
+            self.combined_channels = self.ex_c * self.n_scales
+
         self.pconv2 = nn.Sequential(
-            # pointwise convolution
-            nn.Conv2d(self.ex_c, self.out_c, 1, 1, 0, bias=False),  #
+            nn.Conv2d(self.combined_channels, self.out_c, 1, 1, 0, bias=False),  #
             nn.BatchNorm2d(self.out_c),
         )
-
         if self.use_skip_connection and (self.in_c != self.out_c):
-            # 1x1 逐点卷积
             self.conv1x1 = nn.Conv2d(self.in_c, self.out_c, 1, 1, 0, bias=False)
 
         self.init_weights('normal')
@@ -513,9 +592,13 @@ class MultiKernelInvertedResidualBlock(nn.Module):
 
     def forward(self, x):
         pout1 = self.pconv1(x)
-
-        # <-- MODIFIED: 简化了前向传播 -->
-        dout = self.multi_scale_dwconv(pout1)
+        dwconv_outs = self.multi_scale_dwconv(pout1)
+        if self.add == True:
+            dout = 0
+            for dwout in dwconv_outs:
+                dout = dout + dwout
+        else:
+            dout = torch.cat(dwconv_outs, dim=1)
 
         current_channels = dout.shape[1]
         dout = channel_shuffle(dout, gcd(current_channels, self.out_c))
@@ -530,18 +613,17 @@ class MultiKernelInvertedResidualBlock(nn.Module):
             return out
 
 
-def mk_irb_bottleneck(in_c, out_c, n, s, expansion_factor=2, activation='relu6'):
-    """
-    create a series of multi-kernel inverted residual blocks.
-    (MODIFIED: 移除了 kernel_sizes, add, dw_parallel 参数)
-    """
+def mk_irb_bottleneck(in_c, out_c, n, s, expansion_factor=2, dw_parallel=True, add=True, kernel_sizes=[1, 3, 5],
+                      activation='relu6'):
+    """ 您的原始 mk_irb_bottleneck 模块 (已恢复) """
     convs = []
-    xx = MultiKernelInvertedResidualBlock(in_c, out_c, s, expansion_factor=expansion_factor,
-                                          activation=activation)
+    xx = MultiKernelInvertedResidualBlock(in_c, out_c, s, expansion_factor=expansion_factor, dw_parallel=dw_parallel,
+                                          add=add, kernel_sizes=kernel_sizes, activation=activation)
     convs.append(xx)
     if n > 1:
         for i in range(1, n):
             xx = MultiKernelInvertedResidualBlock(out_c, out_c, 1, expansion_factor=expansion_factor,
+                                                  dw_parallel=dw_parallel, add=add, kernel_sizes=kernel_sizes,
                                                   activation=activation)
             convs.append(xx)
     conv = nn.Sequential(*convs)
@@ -550,33 +632,56 @@ def mk_irb_bottleneck(in_c, out_c, n, s, expansion_factor=2, activation='relu6')
 
 class MK_UNet(nn.Module):
 
-    # (MODIFIED: 移除了 kernel_sizes)
+    # (MODIFIED: 恢复 kernel_sizes, 移除 gag_kernel)
     def __init__(self, num_classes=1, in_channels=3, channels=[16, 32, 64, 96, 160], depths=[1, 1, 1, 1, 1],
-                 expansion_factor=2, gag_kernel=3, **kwargs):
+                 kernel_sizes=[1, 3, 5], expansion_factor=2, **kwargs):
         super().__init__()
 
-        # (MODIFIED: 调用时移除了 kernel_sizes, add, dw_parallel)
-        self.encoder1 = mk_irb_bottleneck(in_channels, channels[0], depths[0], 1, expansion_factor=expansion_factor)
-        self.encoder2 = mk_irb_bottleneck(channels[0], channels[1], depths[1], 1, expansion_factor=expansion_factor)
-        self.encoder3 = mk_irb_bottleneck(channels[1], channels[2], depths[2], 1, expansion_factor=expansion_factor)
-        self.encoder4 = mk_irb_bottleneck(channels[2], channels[3], depths[3], 1, expansion_factor=expansion_factor)
-        self.encoder5 = mk_irb_bottleneck(channels[3], channels[4], depths[4], 1, expansion_factor=expansion_factor)
+        # --- 恢复原始 Encoder/Decoder ---
+        self.encoder1 = mk_irb_bottleneck(in_channels, channels[0], depths[0], 1, expansion_factor=expansion_factor,
+                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
+        self.encoder2 = mk_irb_bottleneck(channels[0], channels[1], depths[1], 1, expansion_factor=expansion_factor,
+                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
+        self.encoder3 = mk_irb_bottleneck(channels[1], channels[2], depths[2], 1, expansion_factor=expansion_factor,
+                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
+        self.encoder4 = mk_irb_bottleneck(channels[2], channels[3], depths[3], 1, expansion_factor=expansion_factor,
+                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
+        self.encoder5 = mk_irb_bottleneck(channels[3], channels[4], depths[4], 1, expansion_factor=expansion_factor,
+                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
 
-        self.AG1 = GroupedAttentionGate(F_g=channels[3], F_l=channels[3], F_int=channels[3] // 2,
-                                        kernel_size=gag_kernel, groups=channels[3] // 2)
-        self.AG2 = GroupedAttentionGate(F_g=channels[2], F_l=channels[2], F_int=channels[2] // 2,
-                                        kernel_size=gag_kernel, groups=channels[2] // 2)
-        self.AG3 = GroupedAttentionGate(F_g=channels[1], F_l=channels[1], F_int=channels[1] // 2,
-                                        kernel_size=gag_kernel, groups=channels[1] // 2)
-        self.AG4 = GroupedAttentionGate(F_g=channels[0], F_l=channels[0], F_int=channels[0] // 2,
-                                        kernel_size=gag_kernel, groups=channels[0] // 2)
+        self.decoder1 = mk_irb_bottleneck(channels[4], channels[3], 1, 1, expansion_factor=expansion_factor,
+                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
+        self.decoder2 = mk_irb_bottleneck(channels[3], channels[2], 1, 1, expansion_factor=expansion_factor,
+                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
+        self.decoder3 = mk_irb_bottleneck(channels[2], channels[1], 1, 1, expansion_factor=expansion_factor,
+                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
+        self.decoder4 = mk_irb_bottleneck(channels[1], channels[0], 1, 1, expansion_factor=expansion_factor,
+                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
+        self.decoder5 = mk_irb_bottleneck(channels[0], channels[0], 1, 1, expansion_factor=expansion_factor,
+                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
 
-        self.decoder1 = mk_irb_bottleneck(channels[4], channels[3], 1, 1, expansion_factor=expansion_factor)
-        self.decoder2 = mk_irb_bottleneck(channels[3], channels[2], 1, 1, expansion_factor=expansion_factor)
-        self.decoder3 = mk_irb_bottleneck(channels[2], channels[1], 1, 1, expansion_factor=expansion_factor)
-        self.decoder4 = mk_irb_bottleneck(channels[1], channels[0], 1, 1, expansion_factor=expansion_factor)
-        self.decoder5 = mk_irb_bottleneck(channels[0], channels[0], 1, 1, expansion_factor=expansion_factor)
+        # --- (MODIFIED) 添加 SID 模块 ---
+        # SID_Lite 接收瓶颈层 C4=160, 输出 C4=160
+        self.sid = SID_Lite(in_c=channels[4], out_c=channels[4])
 
+        # --- (MODIFIED) 添加 CDFA 模块 替换 AG ---
+        # CDFA(in_c, out_c) -> x: in_c, fg/bg: out_c
+        self.cdfa1 = ContrastDrivenFeatureAggregation(in_c=channels[3], out_c=channels[3])  # 96, 96
+        self.cdfa2 = ContrastDrivenFeatureAggregation(in_c=channels[2], out_c=channels[2])  # 64, 64
+        self.cdfa3 = ContrastDrivenFeatureAggregation(in_c=channels[1], out_c=channels[1])  # 32, 32
+        self.cdfa4 = ContrastDrivenFeatureAggregation(in_c=channels[0], out_c=channels[0])  # 16, 16
+
+        # --- (MODIFIED) 添加 1x1 卷积用于投影 fg/bg
+        self.fg_proj1 = nn.Conv2d(channels[4], channels[3], kernel_size=1)  # 160 -> 96
+        self.bg_proj1 = nn.Conv2d(channels[4], channels[3], kernel_size=1)
+        self.fg_proj2 = nn.Conv2d(channels[4], channels[2], kernel_size=1)  # 160 -> 64
+        self.bg_proj2 = nn.Conv2d(channels[4], channels[2], kernel_size=1)
+        self.fg_proj3 = nn.Conv2d(channels[4], channels[1], kernel_size=1)  # 160 -> 32
+        self.bg_proj3 = nn.Conv2d(channels[4], channels[1], kernel_size=1)
+        self.fg_proj4 = nn.Conv2d(channels[4], channels[0], kernel_size=1)  # 160 -> 16
+        self.bg_proj4 = nn.Conv2d(channels[4], channels[0], kernel_size=1)
+
+        # --- 原始 CA / SA / Out 保持不变 ---
         self.CA1 = ChannelAttention(channels[4], ratio=16)
         self.CA2 = ChannelAttention(channels[3], ratio=16)
         self.CA3 = ChannelAttention(channels[2], ratio=16)
@@ -585,11 +690,10 @@ class MK_UNet(nn.Module):
 
         self.SA = SpatialAttention()
 
-        # 1x1 输出卷积
-        self.out1 = nn.Conv2d(channels[2], num_classes, kernel_size=1)
-        self.out2 = nn.Conv2d(channels[1], num_classes, kernel_size=1)
-        self.out3 = nn.Conv2d(channels[0], num_classes, kernel_size=1)
-        self.out4 = nn.Conv2d(channels[0], num_classes, kernel_size=1)
+        self.out1 = nn.Conv2d(channels[2], num_classes, kernel_size=1)  # 64
+        self.out2 = nn.Conv2d(channels[1], num_classes, kernel_size=1)  # 32
+        self.out3 = nn.Conv2d(channels[0], num_classes, kernel_size=1)  # 16
+        self.out4 = nn.Conv2d(channels[0], num_classes, kernel_size=1)  # 16
 
     def forward(self, x):
         if x.shape[1] == 1:
@@ -599,50 +703,80 @@ class MK_UNet(nn.Module):
         ### Encoder
         ### Stage 1
         out = F.max_pool2d(self.encoder1(x), 2, 2)
-        t1 = out
+        t1 = out  # B, C0, H/2, W/2
         ### Stage 2
         out = F.max_pool2d(self.encoder2(out), 2, 2)
-        t2 = out
+        t2 = out  # B, C1, H/4, W/4
         ### Stage 3
         out = F.max_pool2d(self.encoder3(out), 2, 2)
-        t3 = out
-
+        t3 = out  # B, C2, H/8, W/8
         ### Stage 4
         out = F.max_pool2d(self.encoder4(out), 2, 2)
-        t4 = out
+        t4 = out  # B, C3, H/16, W/16
 
         ### Bottleneck
-        out = F.max_pool2d(self.encoder5(out), 2, 2)
+        out = F.max_pool2d(self.encoder5(out), 2, 2)  # B, C4, H/32, W/32
+
+        ### (MODIFIED) 提取语义特征
+        f_fg, f_bg = self.sid(out)  # B, C4, H/32, W/32
 
         ### Stage 4
         out = self.CA1(out) * out
         out = self.SA(out) * out
-        out = F.relu(F.interpolate(self.decoder1(out), scale_factor=(2, 2), mode='bilinear'))
-        t4 = self.AG1(g=out, x=t4)
-        out = torch.add(out, t4)
+        up_out = F.relu(F.interpolate(self.decoder1(out), scale_factor=(2, 2), mode='bilinear'))  # B, C3, H/16, W/16
+
+        # (MODIFIED) 使用 CDFA 替换 AG
+        fg_guide_s4 = self.fg_proj1(F.interpolate(f_fg, scale_factor=2, mode='bilinear'))
+        bg_guide_s4 = self.bg_proj1(F.interpolate(f_bg, scale_factor=2, mode='bilinear'))
+        t4_fused = self.cdfa1(x=t4, fg=fg_guide_s4, bg=bg_guide_s4)  # 使用 CDFA 重构 t4
+        out = torch.add(up_out, t4_fused)  # 融合
 
         ### Stage 3
         out = self.CA2(out) * out
         out = self.SA(out) * out
-        out = F.relu(F.interpolate(self.decoder2(out), scale_factor=(2, 2), mode='bilinear'))
-        p1 = F.interpolate(self.out1(out), scale_factor=(8, 8), mode='bilinear')
-        t3 = self.AG2(g=out, x=t3)
-        out = torch.add(out, t3)
+        up_out = F.relu(F.interpolate(self.decoder2(out), scale_factor=(2, 2), mode='bilinear'))  # B, C2, H/8, W/8
 
+        # --- START FIX ---
+        p1 = F.interpolate(self.out1(up_out), scale_factor=(8, 8), mode='bilinear')
+        # --- END FIX ---
+
+        # (MODIFIED)
+        fg_guide_s3 = self.fg_proj2(F.interpolate(f_fg, scale_factor=4, mode='bilinear'))
+        bg_guide_s3 = self.bg_proj2(F.interpolate(f_bg, scale_factor=4, mode='bilinear'))
+        t3_fused = self.cdfa2(x=t3, fg=fg_guide_s3, bg=bg_guide_s3)
+        out = torch.add(up_out, t3_fused)
+
+        ### Stage 2
         out = self.CA3(out) * out
         out = self.SA(out) * out
-        out = F.relu(F.interpolate(self.decoder3(out), scale_factor=(2, 2), mode='bilinear'))
-        p2 = F.interpolate(self.out2(out), scale_factor=(4, 4), mode='bilinear')
-        t2 = self.AG3(g=out, x=t2)
-        out = torch.add(out, t2)
+        up_out = F.relu(F.interpolate(self.decoder3(out), scale_factor=(2, 2), mode='bilinear'))  # B, C1, H/4, W/4
 
+        # --- START FIX ---
+        p2 = F.interpolate(self.out2(up_out), scale_factor=(4, 4), mode='bilinear')
+        # --- END FIX ---
+
+        # (MODIFIED)
+        fg_guide_s2 = self.fg_proj3(F.interpolate(f_fg, scale_factor=8, mode='bilinear'))
+        bg_guide_s2 = self.bg_proj3(F.interpolate(f_bg, scale_factor=8, mode='bilinear'))
+        t2_fused = self.cdfa3(x=t2, fg=fg_guide_s2, bg=bg_guide_s2)
+        out = torch.add(up_out, t2_fused)
+
+        ### Stage 1
         out = self.CA4(out) * out
         out = self.SA(out) * out
-        out = F.relu(F.interpolate(self.decoder4(out), scale_factor=(2, 2), mode='bilinear'))
-        p3 = F.interpolate(self.out3(out), scale_factor=(2, 2), mode='bilinear')
-        t1 = self.AG4(g=out, x=t1)
-        out = torch.add(out, t1)
+        up_out = F.relu(F.interpolate(self.decoder4(out), scale_factor=(2, 2), mode='bilinear'))  # B, C0, H/2, W/2
 
+        # --- START FIX ---
+        p3 = F.interpolate(self.out3(up_out), scale_factor=(2, 2), mode='bilinear')
+        # --- END FIX ---
+
+        # (MODIFIED)
+        fg_guide_s1 = self.fg_proj4(F.interpolate(f_fg, scale_factor=16, mode='bilinear'))
+        bg_guide_s1 = self.bg_proj4(F.interpolate(f_bg, scale_factor=16, mode='bilinear'))
+        t1_fused = self.cdfa4(x=t1, fg=fg_guide_s1, bg=bg_guide_s1)
+        out = torch.add(up_out, t1_fused)
+
+        ### Final Stage
         out = self.CA5(out) * out
         out = self.SA(out) * out
         out = F.relu(F.interpolate(self.decoder5(out), scale_factor=(2, 2), mode='bilinear'))
@@ -658,14 +792,14 @@ if __name__ == '__main__':
     if torch.cuda.is_available():
         input = torch.randn(1, 3, 256, 256).cuda()
 
-        # (MODIFIED: 移除了 kernel_sizes)
+        # (MODIFIED: 恢复原始参数)
         model = MK_UNet(num_classes=1, in_channels=3, channels=[16, 32, 64, 96, 160], depths=[1, 1, 1, 1, 1],
-                        expansion_factor=2, gag_kernel=3).to(torch.device('cuda:0'))
+                        kernel_sizes=[1, 3, 5], expansion_factor=2).to(torch.device('cuda:0'))
 
         flops, params = profile(model, inputs=(input,))
         output = model(input)
 
-        print(f"\n--- Final Model Output (with Dilated_conv_Module) ---")
+        print(f"\n--- Final Model Output (with SID + CDFA) ---")
         print(f"Input shape: {input.shape}")
         print(f"Output shape: {output[0].shape}")
         print(f"FLOPs (G): {flops / 1e9}")
