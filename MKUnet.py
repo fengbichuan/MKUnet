@@ -14,7 +14,7 @@ from timm.models import named_apply
 
 
 # ===================================================================
-# ===== 1. 您的 CosinConv2D 模块 (已修正) ==========================
+# ===== 1. 您的 CosinConv2D 模块 (无变动) ============================
 # ===================================================================
 
 class CosinConv2D(nn.Conv2d):
@@ -37,7 +37,6 @@ class CosinConv2D(nn.Conv2d):
             padding: int = 0,
             stride: int = 1,
             groups: int = 1,
-            dilation: int = 1,  # <-- MODIFIED: 增加了 dilation 参数以兼容 LKP
             shared_weights: bool = False,
             w_max: float = 1.0,
             p_min: float = 0.1,
@@ -68,7 +67,6 @@ class CosinConv2D(nn.Conv2d):
             padding=padding,
             stride=stride,
             groups=groups,
-            dilation=dilation,  # <-- MODIFIED: 传递 dilation
         )
 
         # 将 kernel_size 存为 int（假设方核）
@@ -107,8 +105,6 @@ class CosinConv2D(nn.Conv2d):
         )
         self.register_buffer("ones_kernel", ones, persistent=False)
 
-    # ------------------ 核心计算 (已修正) ------------------
-    # <-- MODIFIED: 修正了 forward 的缩进，使其成为类的方法
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 约束 learnable 参数范围
         p_clamped = torch.clamp(self.p, min=self.p_min)
@@ -135,8 +131,7 @@ class CosinConv2D(nn.Conv2d):
         # 2) 计算归一化后的 cos 相似度（分母为输入局部 L2 范数 + q）
         x_norm = self._input_norm(x, q)  # (B, C_out, H_out, W_out)
         cos_sim = F.conv2d(
-            x, weight_n, stride=self.stride, padding=self.padding, groups=self.groups,
-            dilation=self.dilation  # <-- MODIFIED: 传递 dilation
+            x, weight_n, stride=self.stride, padding=self.padding, groups=self.groups
         ) / (x_norm + self.eps)
 
         # 3) 带符号幂缩放
@@ -154,8 +149,7 @@ class CosinConv2D(nn.Conv2d):
             ones,
             stride=self.stride,
             padding=self.padding,
-            groups=self.groups,
-            dilation=self.dilation  # <-- MODIFIED: 传递 dilation
+            groups=self.groups
         )  # (B, groups, H_out, W_out)
 
         # L2 范数 + q
@@ -167,7 +161,110 @@ class CosinConv2D(nn.Conv2d):
 
 
 # ===================================================================
-# ===== 2. 您的 MK_UNet 模型（及辅助模块）==============================
+# ===== 2. 引入的新模块 (来自 8、PConv(AAAI2025).py) ==================
+# ===================================================================
+
+# CBR模块：卷积 -> 批归一化 -> 可选ReLU激活
+class Dilated_CBR(nn.Module):
+    def __init__(self, in_c, out_c, kernel_size=3, padding=1, dilation=1, stride=1, act=True):
+        super().__init__()
+        self.act = act  # 控制是否激活
+        # 构建卷积和归一化组合层
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_c, out_c, kernel_size, stride=stride, padding=padding, dilation=dilation, bias=False),
+            nn.BatchNorm2d(out_c)
+        )
+        self.relu = nn.ReLU(inplace=True)  # 使用ReLU激活函数
+        # ai缝合大王
+
+    def forward(self, x):
+        x = self.conv(x)
+        if self.act:
+            x = self.relu(x)
+        return x
+
+
+# 通道注意力模块：结合全局平均和最大池化，生成通道权重
+class Dilated_channel_attention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(Dilated_channel_attention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # 全局平均池化
+        self.max_pool = nn.AdaptiveMaxPool2d(1)  # 全局最大池化
+
+        # --- START FIX ---
+        # 确保缩减后的通道数至少为 1
+        reduced_channels = max(1, in_planes // ratio)
+        # --- END FIX ---
+
+        self.fc1 = nn.Conv2d(in_planes, reduced_channels, kernel_size=1, bias=False)  # 通道降维
+        self.relu1 = nn.ReLU()  # 激活
+        self.fc2 = nn.Conv2d(reduced_channels, in_planes, kernel_size=1, bias=False)  # 通道升维
+
+        self.sigmoid = nn.Sigmoid()  # 映射到 [0, 1]
+
+    def forward(self, x):
+        x_orig = x  # 保留原始输入
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return x_orig * self.sigmoid(out)
+
+
+# 空间注意力模块：利用通道统计生成空间权重图
+class Dilated_spatial_attention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(Dilated_spatial_attention, self).__init__()
+        # 核尺寸必须为3或7
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()  # 将卷积输出映射至 [0,1]
+        # ai缝合大王
+
+    def forward(self, x):
+        x_orig = x  # 保存原始特征
+        avg_out = torch.mean(x, dim=1, keepdim=True)  # 对通道取平均
+        max_out, _ = torch.max(x, dim=1, keepdim=True)  # 对通道取最大值
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        x_conv = self.conv1(x_cat)
+        return x_orig * self.sigmoid(x_conv)
+
+
+# 膨胀卷积模块：采用不同膨胀率的卷积以捕捉多尺度上下文信息，并通过注意力机制进行特征重构
+class Dilated_conv_Module(nn.Module):
+    def __init__(self, in_c, out_c):
+        super().__init__()
+        self.relu = nn.ReLU(inplace=True)
+        # 每个分支先用CBR模块做卷积，再结合通道注意力
+        self.c1 = nn.Sequential(Dilated_CBR(in_c, out_c, kernel_size=1, padding=0), Dilated_channel_attention(out_c))
+        self.c2 = nn.Sequential(Dilated_CBR(in_c, out_c, kernel_size=3, padding=6, dilation=6),
+                                Dilated_channel_attention(out_c))
+        self.c3 = nn.Sequential(Dilated_CBR(in_c, out_c, kernel_size=3, padding=12, dilation=12),
+                                Dilated_channel_attention(out_c))
+        self.c4 = nn.Sequential(Dilated_CBR(in_c, out_c, kernel_size=3, padding=18, dilation=18),
+                                Dilated_channel_attention(out_c))
+        # 合并分支后使用3x3卷积整合多尺度信息
+        self.c5 = Dilated_CBR(out_c * 4, out_c, kernel_size=3, padding=1, act=False)
+        # 直接1x1卷积对输入进行映射
+        self.c6 = Dilated_CBR(in_c, out_c, kernel_size=1, padding=0, act=False)
+        self.sa = Dilated_spatial_attention()  # 空间注意力模块
+
+    def forward(self, x):
+        x1 = self.c1(x)
+        x2 = self.c2(x)
+        x3 = self.c3(x)
+        x4 = self.c4(x)
+        # 将四个分支输出在通道维度上拼接
+        xc = torch.cat([x1, x2, x3, x4], axis=1)
+        xc = self.c5(xc)
+        xs = self.c6(x)
+        x_out = self.relu(xc + xs)  # 残差连接和激活
+        x_out = self.sa(x_out)  # 空间注意力加权
+        return x_out
+
+
+# ===================================================================
+# ===== 3. 您的 MK_UNet 模型（已修改）=================================
 # ===================================================================
 
 def gcd(a, b):
@@ -177,7 +274,7 @@ def gcd(a, b):
 
 
 def _init_weights(module, name, scheme=''):
-    if isinstance(module, nn.Conv2d):  # <-- CosinConv2D 继承自 nn.Conv2d
+    if isinstance(module, nn.Conv2d):  # CosinConv2D 也会被初始化
         if scheme == 'normal':
             nn.init.normal_(module.weight, std=.02)
             if module.bias is not None:
@@ -195,6 +292,7 @@ def _init_weights(module, name, scheme=''):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         else:
+            # efficientnet like
             if hasattr(module, 'kernel_size') and isinstance(module.kernel_size, tuple):
                 fan_out = module.kernel_size[0] * module.kernel_size[1] * module.out_channels
             elif hasattr(module, 'kernel_size') and isinstance(module.kernel_size, int):
@@ -212,8 +310,6 @@ def _init_weights(module, name, scheme=''):
     elif isinstance(module, nn.LayerNorm):
         nn.init.constant_(module.weight, 1)
         nn.init.constant_(module.bias, 0)
-
-    # CosinConv2D 的 p 和 log_q 在 __init__ 中有自己的初始化，无需在此处处理
 
 
 def act_layer(act, inplace=False, neg_slope=0.2, n_prelu=1):
@@ -251,6 +347,8 @@ def channel_shuffle(x, groups):
 
 
 class ChannelAttention(nn.Module):
+    """ 您的原始 ChannelAttention 模块 """
+
     def __init__(self, in_planes, out_planes=None, ratio=16, activation='relu'):
         super(ChannelAttention, self).__init__()
         self.in_planes = in_planes
@@ -287,13 +385,15 @@ class ChannelAttention(nn.Module):
 
 
 class SpatialAttention(nn.Module):
+    """ 您的原始 SpatialAttention 模块 (已应用 CosinConv2D) """
+
     def __init__(self, kernel_size=7):
         super(SpatialAttention, self).__init__()
 
         assert kernel_size in (3, 7, 11), 'kernel size must be 3 or 7 or 11'
         padding = kernel_size // 2
 
-        # <-- MODIFIED: 将 nn.Conv2d 替换为 CosinConv2D (来自您的代码)
+        # <-- 使用 CosinConv2D -->
         self.conv = CosinConv2D(
             in_channels=2,
             out_channels=1,
@@ -302,7 +402,9 @@ class SpatialAttention(nn.Module):
             stride=1,
             groups=1
         )
+
         self.sigmoid = nn.Sigmoid()
+
         self.init_weights('normal')
 
     def init_weights(self, scheme=''):
@@ -322,7 +424,6 @@ class GroupedAttentionGate(nn.Module):
         if kernel_size == 1:
             groups = 1
 
-        # 这里的 'groups' 参数不等于 1 或 in_channels，不能替换为 CosinConv2D
         self.W_g = nn.Sequential(
             nn.Conv2d(F_g, F_int, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, groups=groups,
                       bias=True),
@@ -342,6 +443,7 @@ class GroupedAttentionGate(nn.Module):
         )
 
         self.activation = act_layer(activation, inplace=True)
+
         self.init_weights('normal')
 
     def init_weights(self, scheme=''):
@@ -356,201 +458,52 @@ class GroupedAttentionGate(nn.Module):
         return x * psi
 
 
-# ===================================================================
-# ===== 3. 插入 LSConv (已融合 CosinConv2D) =========================
-# ===================================================================
-
-# ===== 原始 Conv2d + BN (来自您的 LSNet 代码) =====
-class Conv2d_BN(nn.Sequential):
-    def __init__(self, a, b, ks=1, stride=1, pad=0, dilation=1,
-                 groups=1, bn_weight_init=1):
-        super().__init__()
-        self.add_module('c', nn.Conv2d(a, b, ks, stride, pad, dilation, groups, bias=False))
-        self.add_module('bn', nn.BatchNorm2d(b))
-        nn.init.constant_(self.bn.weight, bn_weight_init)
-        nn.init.constant_(self.bn.bias, 0)
-
-
-# ===== NEW: CosinConv2d + BN 辅助类 =====
-# 这是一个新的辅助类，用于封装 CosinConv2D 和 BN
-class CosinConv2d_BN(nn.Sequential):
-    def __init__(self, a, b, ks=1, stride=1, pad=0, dilation=1,
-                 groups=1, bn_weight_init=1):
-        super().__init__()
-        # 使用 CosinConv2D 替换 nn.Conv2d
-        self.add_module('c', CosinConv2D(
-            in_channels=a,
-            out_channels=b,
-            kernel_size=ks,
-            stride=stride,
-            padding=pad,
-            dilation=dilation,
-            groups=groups
-        ))
-        self.add_module('bn', nn.BatchNorm2d(b))
-        nn.init.constant_(self.bn.weight, bn_weight_init)
-        nn.init.constant_(self.bn.bias, 0)
-
-        # 注意：CosinConv2D 内部的 p, q, weight 已经有自己的初始化方案
-        # 我们不需要在这里对 'c' 模块的权重进行额外初始化
-
-
-# ===== LKP: Lightweight Kernel Prediction (MODIFIED) =====
-# 这个 LKP 模块现在使用 CosinConv2D 来预测动态核
-class LKP(nn.Module):
-    def __init__(self, dim, lks, sks, groups):
-        super().__init__()
-
-        # MODIFIED: 使用 CosinConv2d_BN (groups=1, 兼容)
-        self.cv1 = CosinConv2d_BN(dim, dim // 2, ks=1, pad=0, groups=1)
-        self.act = nn.ReLU()
-
-        # MODIFIED: 使用 CosinConv2d_BN (groups=dim//2=in_channels, 兼容)
-        self.cv2 = CosinConv2d_BN(dim // 2, dim // 2, ks=lks, pad=(lks - 1) // 2, groups=dim // 2)
-
-        # MODIFIED: 使用 CosinConv2d_BN (groups=1, 兼容)
-        self.cv3 = CosinConv2d_BN(dim // 2, dim // 2, ks=1, pad=0, groups=1)
-
-        # MODIFIED: 使用 CosinConv2D (groups=1, 兼容)
-        self.cv4 = CosinConv2D(
-            in_channels=dim // 2,
-            out_channels=sks ** 2 * dim // groups,
-            kernel_size=1,
-            groups=1
-        )
-
-        self.norm = nn.GroupNorm(num_groups=dim // groups, num_channels=sks ** 2 * dim // groups)
-
-        self.sks = sks
-        self.groups = groups
-        self.dim = dim
-
-    def forward(self, x):
-        # 这里的计算流程保持不变
-        x = self.act(self.cv3(self.cv2(self.act(self.cv1(x)))))
-        w = self.norm(self.cv4(x))
-        b, _, h, width = w.size()
-        w = w.view(b, self.dim // self.groups, self.sks ** 2, h, width)
-        return w
-
-
-# ===== SKA: Spatial Kernel Attention (来自您的 LSNet 代码) =====
-# (保持不变)
-class SKA(nn.Module):
-    def forward(self, x, w):
-        """
-        x: [B, C, H, W]
-        w: [B, G, K*K, H, W]
-        G = C // groups
-        """
-        B, C, H, W = x.shape
-        G = w.shape[1]
-        K = int(w.shape[2] ** 0.5)
-        pad = K // 2
-        out = torch.zeros_like(x)
-
-        x_unfold = torch.nn.functional.unfold(x, kernel_size=K, padding=pad)  # [B, C*K*K, H*W]
-        x_unfold = x_unfold.view(B, G, C // G, K * K, H, W)  # [B, G, C//G, K*K, H, W]
-
-        w = w.view(B, G, 1, K * K, H, W)  # [B, G, 1, K*K, H, W]
-        out_group = (x_unfold * w).sum(dim=3)  # [B, G, C//G, H, W]
-        out = out_group.view(B, C, H, W)
-        return out
-
-
-# ===== LSConv (来自您的 LSNet 代码) =====
-# (保持不变, 它现在会自动使用修改后的 LKP)
-class LSConv(nn.Module):
-    def __init__(self, dim):
-        super(LSConv, self).__init__()
-        self.lkp = LKP(dim, lks=7, sks=3, groups=8)
-        self.ska = SKA()
-        self.bn = nn.BatchNorm2d(dim)
-
-    def forward(self, x):
-        return self.bn(self.ska(x, self.lkp(x))) + x
-
-
-# ===================================================================
-# ===== 4. 继续您的 MK_UNet 模型（已修改）============================
-# ===================================================================
-
-class MultiKernelDepthwiseConv(nn.Module):
-    def __init__(self, in_channels, kernel_sizes, stride, activation='relu6', dw_parallel=True):
-        super(MultiKernelDepthwiseConv, self).__init__()
-        self.in_channels = in_channels
-        self.dw_parallel = dw_parallel
-        self.dwconvs = nn.ModuleList([
-            nn.Sequential(
-                # <-- MODIFIED: 将 nn.Conv2d 替换为 CosinConv2D (来自您的代码)
-                CosinConv2D(
-                    in_channels=self.in_channels,
-                    out_channels=self.in_channels,
-                    kernel_size=kernel_size,
-                    stride=stride,
-                    padding=kernel_size // 2,
-                    groups=self.in_channels
-                ),
-                nn.BatchNorm2d(self.in_channels),
-                act_layer(activation, inplace=True)
-            )
-            for kernel_size in kernel_sizes
-        ])
-        self.init_weights('normal')
-
-    def init_weights(self, scheme=''):
-        named_apply(partial(_init_weights, scheme=scheme), self)
-
-    def forward(self, x):
-        outputs = []
-        for dwconv in self.dwconvs:
-            dw_out = dwconv(x)
-            outputs.append(dw_out)
-            if self.dw_parallel == False:
-                x = x + dw_out
-        return outputs
+# ----- (已移除 MultiKernelDepthwiseConv) -----
 
 
 class MultiKernelInvertedResidualBlock(nn.Module):
     """
     inverted residual block used in MobileNetV2
+    (MODIFIED: 使用 Dilated_conv_Module 替换 MultiKernelDepthwiseConv)
     """
 
-    def __init__(self, in_c, out_c, stride, expansion_factor=2, dw_parallel=True, add=True, kernel_sizes=[1, 3, 5],
-                 activation='relu6'):
+    def __init__(self, in_c, out_c, stride, expansion_factor=2, activation='relu6'):
         super(MultiKernelInvertedResidualBlock, self).__init__()
+        # check stride value
         assert stride in [1, 2]
         self.stride = stride
         self.in_c = in_c
         self.out_c = out_c
-        self.kernel_sizes = kernel_sizes
-        self.add = add
-        self.n_scales = len(kernel_sizes)
+        # Skip connection if stride is 1
         self.use_skip_connection = True if self.stride == 1 else False
+
+        # expansion factor or t as mentioned in the paper
         self.ex_c = int(self.in_c * expansion_factor)
 
-        # 1x1 逐点卷积，保持为 nn.Conv2d
+        # 1x1 逐点卷积
         self.pconv1 = nn.Sequential(
+            # pointwise convolution
             nn.Conv2d(self.in_c, self.ex_c, 1, 1, 0, bias=False),
             nn.BatchNorm2d(self.ex_c),
             act_layer(activation, inplace=True)
         )
 
-        # 这里调用了 MultiKernelDepthwiseConv，已在上面修改
-        self.multi_scale_dwconv = MultiKernelDepthwiseConv(self.ex_c, self.kernel_sizes, self.stride, activation,
-                                                           dw_parallel=dw_parallel)
+        # <-- MODIFIED: 使用新的多尺度（膨胀）模块 -->
+        self.multi_scale_dwconv = nn.Sequential(
+            Dilated_conv_Module(self.ex_c, self.ex_c),
+            nn.BatchNorm2d(self.ex_c),  # 添加 BN + Act 以匹配原始 DWConv 块
+            act_layer(activation, inplace=True)
+        )
 
-        if self.add == True:
-            self.combined_channels = self.ex_c * 1
-        else:
-            self.combined_channels = self.ex_c * self.n_scales
-
-        # 1x1 逐点卷积，保持为 nn.Conv2d
+        # 1x1 逐点卷积
         self.pconv2 = nn.Sequential(
-            nn.Conv2d(self.combined_channels, self.out_c, 1, 1, 0, bias=False),
+            # pointwise convolution
+            nn.Conv2d(self.ex_c, self.out_c, 1, 1, 0, bias=False),  #
             nn.BatchNorm2d(self.out_c),
         )
+
         if self.use_skip_connection and (self.in_c != self.out_c):
+            # 1x1 逐点卷积
             self.conv1x1 = nn.Conv2d(self.in_c, self.out_c, 1, 1, 0, bias=False)
 
         self.init_weights('normal')
@@ -560,13 +513,9 @@ class MultiKernelInvertedResidualBlock(nn.Module):
 
     def forward(self, x):
         pout1 = self.pconv1(x)
-        dwconv_outs = self.multi_scale_dwconv(pout1)
-        if self.add == True:
-            dout = 0
-            for dwout in dwconv_outs:
-                dout = dout + dwout
-        else:
-            dout = torch.cat(dwconv_outs, dim=1)
+
+        # <-- MODIFIED: 简化了前向传播 -->
+        dout = self.multi_scale_dwconv(pout1)
 
         current_channels = dout.shape[1]
         dout = channel_shuffle(dout, gcd(current_channels, self.out_c))
@@ -581,16 +530,18 @@ class MultiKernelInvertedResidualBlock(nn.Module):
             return out
 
 
-def mk_irb_bottleneck(in_c, out_c, n, s, expansion_factor=2, dw_parallel=True, add=True, kernel_sizes=[1, 3, 5],
-                      activation='relu6'):
+def mk_irb_bottleneck(in_c, out_c, n, s, expansion_factor=2, activation='relu6'):
+    """
+    create a series of multi-kernel inverted residual blocks.
+    (MODIFIED: 移除了 kernel_sizes, add, dw_parallel 参数)
+    """
     convs = []
-    xx = MultiKernelInvertedResidualBlock(in_c, out_c, s, expansion_factor=expansion_factor, dw_parallel=dw_parallel,
-                                          add=add, kernel_sizes=kernel_sizes, activation=activation)
+    xx = MultiKernelInvertedResidualBlock(in_c, out_c, s, expansion_factor=expansion_factor,
+                                          activation=activation)
     convs.append(xx)
     if n > 1:
         for i in range(1, n):
             xx = MultiKernelInvertedResidualBlock(out_c, out_c, 1, expansion_factor=expansion_factor,
-                                                  dw_parallel=dw_parallel, add=add, kernel_sizes=kernel_sizes,
                                                   activation=activation)
             convs.append(xx)
     conv = nn.Sequential(*convs)
@@ -599,20 +550,17 @@ def mk_irb_bottleneck(in_c, out_c, n, s, expansion_factor=2, dw_parallel=True, a
 
 class MK_UNet(nn.Module):
 
+    # (MODIFIED: 移除了 kernel_sizes)
     def __init__(self, num_classes=1, in_channels=3, channels=[16, 32, 64, 96, 160], depths=[1, 1, 1, 1, 1],
-                 kernel_sizes=[1, 3, 5], expansion_factor=2, gag_kernel=3, **kwargs):
+                 expansion_factor=2, gag_kernel=3, **kwargs):
         super().__init__()
 
-        self.encoder1 = mk_irb_bottleneck(in_channels, channels[0], depths[0], 1, expansion_factor=expansion_factor,
-                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
-        self.encoder2 = mk_irb_bottleneck(channels[0], channels[1], depths[1], 1, expansion_factor=expansion_factor,
-                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
-        self.encoder3 = mk_irb_bottleneck(channels[1], channels[2], depths[2], 1, expansion_factor=expansion_factor,
-                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
-        self.encoder4 = mk_irb_bottleneck(channels[2], channels[3], depths[3], 1, expansion_factor=expansion_factor,
-                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
-        self.encoder5 = mk_irb_bottleneck(channels[3], channels[4], depths[4], 1, expansion_factor=expansion_factor,
-                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
+        # (MODIFIED: 调用时移除了 kernel_sizes, add, dw_parallel)
+        self.encoder1 = mk_irb_bottleneck(in_channels, channels[0], depths[0], 1, expansion_factor=expansion_factor)
+        self.encoder2 = mk_irb_bottleneck(channels[0], channels[1], depths[1], 1, expansion_factor=expansion_factor)
+        self.encoder3 = mk_irb_bottleneck(channels[1], channels[2], depths[2], 1, expansion_factor=expansion_factor)
+        self.encoder4 = mk_irb_bottleneck(channels[2], channels[3], depths[3], 1, expansion_factor=expansion_factor)
+        self.encoder5 = mk_irb_bottleneck(channels[3], channels[4], depths[4], 1, expansion_factor=expansion_factor)
 
         self.AG1 = GroupedAttentionGate(F_g=channels[3], F_l=channels[3], F_int=channels[3] // 2,
                                         kernel_size=gag_kernel, groups=channels[3] // 2)
@@ -623,16 +571,11 @@ class MK_UNet(nn.Module):
         self.AG4 = GroupedAttentionGate(F_g=channels[0], F_l=channels[0], F_int=channels[0] // 2,
                                         kernel_size=gag_kernel, groups=channels[0] // 2)
 
-        self.decoder1 = mk_irb_bottleneck(channels[4], channels[3], 1, 1, expansion_factor=expansion_factor,
-                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
-        self.decoder2 = mk_irb_bottleneck(channels[3], channels[2], 1, 1, expansion_factor=expansion_factor,
-                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
-        self.decoder3 = mk_irb_bottleneck(channels[2], channels[1], 1, 1, expansion_factor=expansion_factor,
-                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
-        self.decoder4 = mk_irb_bottleneck(channels[1], channels[0], 1, 1, expansion_factor=expansion_factor,
-                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
-        self.decoder5 = mk_irb_bottleneck(channels[0], channels[0], 1, 1, expansion_factor=expansion_factor,
-                                          dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
+        self.decoder1 = mk_irb_bottleneck(channels[4], channels[3], 1, 1, expansion_factor=expansion_factor)
+        self.decoder2 = mk_irb_bottleneck(channels[3], channels[2], 1, 1, expansion_factor=expansion_factor)
+        self.decoder3 = mk_irb_bottleneck(channels[2], channels[1], 1, 1, expansion_factor=expansion_factor)
+        self.decoder4 = mk_irb_bottleneck(channels[1], channels[0], 1, 1, expansion_factor=expansion_factor)
+        self.decoder5 = mk_irb_bottleneck(channels[0], channels[0], 1, 1, expansion_factor=expansion_factor)
 
         self.CA1 = ChannelAttention(channels[4], ratio=16)
         self.CA2 = ChannelAttention(channels[3], ratio=16)
@@ -642,7 +585,7 @@ class MK_UNet(nn.Module):
 
         self.SA = SpatialAttention()
 
-        # 1x1 输出卷积，保持为 nn.Conv2d
+        # 1x1 输出卷积
         self.out1 = nn.Conv2d(channels[2], num_classes, kernel_size=1)
         self.out2 = nn.Conv2d(channels[1], num_classes, kernel_size=1)
         self.out3 = nn.Conv2d(channels[0], num_classes, kernel_size=1)
@@ -713,38 +656,19 @@ class MK_UNet(nn.Module):
 if __name__ == '__main__':
     # 确保有可用的CUDA设备
     if torch.cuda.is_available():
-        device = torch.device('cuda:0')
-        print(f"Running on {device}")
+        input = torch.randn(1, 3, 256, 256).cuda()
 
-        # --- 1. 测试 MK_UNet (来自您的代码) ---
-        print("\n--- 1. Testing MK_UNet (with CosinConv2D) ---")
-        input_unet = torch.randn(1, 3, 256, 256).to(device)
-        model_unet = MK_UNet(num_classes=1, in_channels=3, channels=[16, 32, 64, 96, 160], depths=[1, 1, 1, 1, 1],
-                             kernel_sizes=[1, 3, 5], expansion_factor=2, gag_kernel=3).to(device)
+        # (MODIFIED: 移除了 kernel_sizes)
+        model = MK_UNet(num_classes=1, in_channels=3, channels=[16, 32, 64, 96, 160], depths=[1, 1, 1, 1, 1],
+                        expansion_factor=2, gag_kernel=3).to(torch.device('cuda:0'))
 
-        flops, params = profile(model_unet, inputs=(input_unet,))
-        output_unet = model_unet(input_unet)
+        flops, params = profile(model, inputs=(input,))
+        output = model(input)
 
-        print(f"Input shape (MK_UNet): {input_unet.shape}")
-        print(f"Output shape (MK_UNet): {output_unet[0].shape}")
-        print(f"FLOPs (G) (MK_UNet): {flops / 1e9}")
-        print(f"Params (M) (MK_UNet): {params / 1e6}")
-
-        # --- 2. 测试 LSConv (新融合的模块) ---
-        print("\n--- 2. Testing LSConv (with CosinConv2D in LKP) ---")
-        input_lsconv = torch.randn(4, 64, 32, 32).to(device)
-        model_lsconv = LSConv(64).to(device)
-
-        output_lsconv = model_lsconv(input_lsconv)
-        print(f"Input shape (LSConv): {input_lsconv.shape}")
-        print(f"Output shape (LSConv): {output_lsconv.shape}")
-
-        # 测试反向传播
-        try:
-            output_lsconv.sum().backward()
-            print("Backward pass (LSConv) successful.")
-        except Exception as e:
-            print(f"Backward pass (LSConv) FAILED: {e}")
-
+        print(f"\n--- Final Model Output (with Dilated_conv_Module) ---")
+        print(f"Input shape: {input.shape}")
+        print(f"Output shape: {output[0].shape}")
+        print(f"FLOPs (G): {flops / 1e9}")
+        print(f"Params (M): {params / 1e6}")
     else:
         print("CUDA not available. Please run this on a machine with a GPU.")
