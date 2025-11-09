@@ -11,7 +11,7 @@ from tqdm import tqdm
 from MKUnet import MK_UNet
 # 导入你本地的文件
 from dataload import get_loaders
-from metrics import calculate_metrics_and_loss
+from metrics import calculate_metrics_and_loss, CombinedLoss
 
 # --- 1. 配置参数 ---
 # !! 修改为你自己的路径 !!
@@ -27,7 +27,7 @@ IMAGE_HEIGHT = 256
 IMAGE_WIDTH = 256
 PIN_MEMORY = True
 NUM_CLASSES = 1  # <-- 修改点: 二分类 (BCE) 模式下, 输出通道为 1
-SAVE_PATH = "DA_Block+CConv"
+SAVE_PATH = "CConv"
 early_stop_patience = 20
 early_stop_counter = 0
 stage_channels = [16, 32, 64, 96, 160]
@@ -132,7 +132,7 @@ def main():
     # ==================================================================
 
     # Loss 函数
-    loss_fn = nn.BCEWithLogitsLoss()  # <-- 修改点: 更换损失函数
+    loss_fn = CombinedLoss() # <-- 修改点: 更换损失函数
 
     # 优化器
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
