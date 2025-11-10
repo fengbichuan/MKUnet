@@ -105,25 +105,28 @@ class CosinConv2D(nn.Conv2d):
         )
         self.register_buffer("ones_kernel", ones, persistent=False)
 
-        # ------------------ 核心计算 (已修正) ------------------
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            # 约束 learnable 参数范围
-            # [FIX] 使用 torch.clamp (out-of-place) 代替 .clamp_() (inplace)
-            # 不要在 forward 过程中 inplace 修改模型参数，这会导致 autograd 错误
-            p_clamped = torch.clamp(self.p, min=self.p_min)
-            weight_clamped = torch.clamp(self.weight, min=-self.w_max, max=self.w_max)
+    # ------------------ 核心计算 (已修正) ------------------
+    # [注意]：为了让 CosinConv2D 能在 MK_UNet 类中被正确地实例化（它在父类 __init__ 之后才定义 p, log_q 等）
+    # 我们需要把 forward 的定义移到 __init__ 之外，作为类的一个方法。
 
-            q = torch.exp(self.log_q)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 约束 learnable 参数范围
+        # [FIX] 使用 torch.clamp (out-of-place) 代替 .clamp_() (inplace)
+        # 不要在 forward 过程中 inplace 修改模型参数，这会导致 autograd 错误
+        p_clamped = torch.clamp(self.p, min=self.p_min)
+        weight_clamped = torch.clamp(self.weight, min=-self.w_max, max=self.w_max)
 
-            # 根据 shared_weights 展开权重/参数
-            if self.shared_weights:
-                weight = weight_clamped.repeat(self.groups, 1, 1, 1)  # (C_out, Cin/G, k, k)
-                p = p_clamped.repeat(1, self.groups, 1, 1)  # (1, C_out, 1, 1)
-            else:
-                weight = weight_clamped
-                p = p_clamped
+        q = torch.exp(self.log_q)
 
-            return self._cosine_power_conv(x, weight, p, q)
+        # 根据 shared_weights 展开权重/参数
+        if self.shared_weights:
+            weight = weight_clamped.repeat(self.groups, 1, 1, 1)  # (C_out, Cin/G, k, k)
+            p = p_clamped.repeat(1, self.groups, 1, 1)  # (1, C_out, 1, 1)
+        else:
+            weight = weight_clamped
+            p = p_clamped
+
+        return self._cosine_power_conv(x, weight, p, q)
 
     def _cosine_power_conv(self, x: torch.Tensor, weight: torch.Tensor, p: torch.Tensor,
                            q: torch.Tensor) -> torch.Tensor:
@@ -164,7 +167,7 @@ class CosinConv2D(nn.Conv2d):
 
 
 # ===================================================================
-# ===== 2. 你的 MK_UNet 模型（已修改）=================================
+# ===== 2. 你的 MK_UNet 模型（及辅助函数）=============================
 # ===================================================================
 
 def gcd(a, b):
@@ -251,6 +254,48 @@ def channel_shuffle(x, groups):
     return x
 
 
+# ===================================================================
+# ===== 3. [<-- 新增] 插入 SoftPool2D 函数 ===========================
+# ===================================================================
+def soft_pool2d(x, kernel_size=2, stride=2):
+    """
+    Soft-Pooling 2D (non-overlapping, 2x2)
+    用
+    x: (B, C, H, W)
+    """
+    # 确保是 2x2 非重叠池化
+    assert kernel_size == 2 and stride == 2, "This soft_pool2d is hardcoded for 2x2 non-overlapping."
+
+    b, c, h, w = x.shape
+
+    # 1. Reshape: (B, C, H, W) -> (B, C, H/2, 2, W/2, 2)
+    x_reshaped = x.view(b, c, h // 2, 2, w // 2, 2)
+
+    # 2. Permute: (B, C, H/2, 2, W/2, 2) -> (B, C, H/2, W/2, 2, 2)
+    x_permuted = x_reshaped.permute(0, 1, 2, 4, 3, 5).contiguous()
+
+    # 3. Reshape 2x2 块为向量: (B, C, H/2, W/2, 4)
+    # (即: B, C, num_patches_H, num_patches_W, patch_size)
+    # 我们将其视为 (B, C, NumPatches, PatchSize)
+    x_patches = x_permuted.view(b, c, -1, 4)
+
+    # 4. 沿着 4 元素的维度计算 Softmax
+    # 这是每个 2x2 块内部的权重
+    softmax_weights = F.softmax(x_patches, dim=-1)
+
+    # 5. 计算加权和
+    # (B, C, NumPatches, 4) * (B, C, NumPatches, 4) -> sum(dim=-1) -> (B, C, NumPatches)
+    weighted_sum = torch.sum(x_patches * softmax_weights, dim=-1)
+
+    # 6. Reshape 回 2D 图像: (B, C, NumPatches) -> (B, C, H/2, W/2)
+    new_h, new_w = h // 2, w // 2
+    return weighted_sum.view(b, c, new_h, new_w)
+
+
+# ===================================================================
+# ===== 4. 你的模型其余部分（已修改）=================================
+# ===================================================================
+
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, out_planes=None, ratio=16, activation='relu'):
         super(ChannelAttention, self).__init__()
@@ -261,6 +306,8 @@ class ChannelAttention(nn.Module):
         self.reduced_channels = self.in_planes // ratio
         if self.out_planes == None:
             self.out_planes = in_planes
+
+        # 注意：这里的 AdaptiveAvgPool2d 是用于全局特征提取，不是下采样，所以不替换
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
 
@@ -468,7 +515,6 @@ class MultiKernelInvertedResidualBlock(nn.Module):
         else:
             dout = torch.cat(dwconv_outs, dim=1)
 
-
         current_channels = dout.shape[1]
         dout = channel_shuffle(dout, gcd(current_channels, self.out_c))
 
@@ -560,22 +606,27 @@ class MK_UNet(nn.Module):
         ### Encoder
         ### Stage 1
 
-        out = F.avg_pool2d(self.encoder1(x), 2, 2)
+        # out = F.avg_pool2d(self.encoder1(x), 2, 2) # 原始代码
+        out = soft_pool2d(self.encoder1(x), 2, 2)  # [<-- 修改]
 
         t1 = out
         ### Stage 2
-        out = F.avg_pool2d(self.encoder2(out), 2, 2)
+        # out = F.avg_pool2d(self.encoder2(out), 2, 2) # 原始代码
+        out = soft_pool2d(self.encoder2(out), 2, 2)  # [<-- 修改]
         t2 = out
         ### Stage 3
-        out = F.avg_pool2d(self.encoder3(out), 2, 2)
+        # out = F.avg_pool2d(self.encoder3(out), 2, 2) # 原始代码
+        out = soft_pool2d(self.encoder3(out), 2, 2)  # [<-- 修改]
         t3 = out
 
         ### Stage 4
-        out = F.avg_pool2d(self.encoder4(out), 2, 2)
+        # out = F.avg_pool2d(self.encoder4(out), 2, 2) # 原始代码
+        out = soft_pool2d(self.encoder4(out), 2, 2)  # [<-- 修改]
         t4 = out
 
         ### Bottleneck
-        out = F.avg_pool2d(self.encoder5(out), 2, 2)
+        # out = F.avg_pool2d(self.encoder5(out), 2, 2) # 原始代码
+        out = soft_pool2d(self.encoder5(out), 2, 2)  # [<-- 修改]
 
         ### Stage 4
         out = self.CA1(out) * out
@@ -628,7 +679,7 @@ if __name__ == '__main__':
         flops, params = profile(model, inputs=(input,))
         output = model(input)
 
-        print(f"\n--- Final Model Output (with CosinConv2D) ---")  # <-- MODIFIED: 更新了打印信息
+        print(f"\n--- Final Model Output (with CosinConv2D and SoftPool) ---")  # <-- MODIFIED: 更新了打印信息
         print(f"Input shape: {input.shape}")
         print(f"Output shape: {output[0].shape}")
         print(f"FLOPs (G): {flops / 1e9}")
