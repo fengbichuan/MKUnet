@@ -27,7 +27,7 @@ IMAGE_HEIGHT = 256
 IMAGE_WIDTH = 256
 PIN_MEMORY = True
 NUM_CLASSES = 1  # <-- 修改点: 二分类 (BCE) 模式下, 输出通道为 1
-SAVE_PATH = "DWT+CConv"
+SAVE_PATH = "Conv+EGA"
 early_stop_patience = 20
 early_stop_counter = 0
 stage_channels = [16, 32, 64, 96, 160]
@@ -35,7 +35,7 @@ stage_channels = [16, 32, 64, 96, 160]
 # channels = [8,16,32,48,80] for MK_UNet-S
 # channels = [16,32,64,96,160] for MK_UNet
 # channels = [32,64,128,192,320] for MK_UNet-M
-# channels = [64,128,256,384,512] for MK_UNet-L
+#stage_channels = [64,128,256,384,512]
 
 def train_fn(loader, model, optimizer, loss_fn, device):
     """
