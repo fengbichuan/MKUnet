@@ -27,7 +27,7 @@ IMAGE_HEIGHT = 256
 IMAGE_WIDTH = 256
 PIN_MEMORY = True
 NUM_CLASSES = 1  # <-- 修改点: 二分类 (BCE) 模式下, 输出通道为 1
-SAVE_PATH = "Conv+EGA"
+SAVE_PATH = "Conv+encoder[16, 32, 64, 96, 160]"
 early_stop_patience = 20
 early_stop_counter = 0
 stage_channels = [16, 32, 64, 96, 160]
@@ -36,7 +36,7 @@ stage_channels = [16, 32, 64, 96, 160]
 # channels = [16,32,64,96,160] for MK_UNet
 # channels = [32,64,128,192,320] for MK_UNet-M
 #stage_channels = [64,128,256,384,512]
-
+#stage_channels = [64,128,256,512,1024]
 def train_fn(loader, model, optimizer, loss_fn, device):
     """
     训练一个 Epoch
