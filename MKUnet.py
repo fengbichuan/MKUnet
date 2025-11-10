@@ -151,6 +151,7 @@ def gcd(a, b):
 
 
 def _init_weights(module, name, scheme=''):
+    # ... (代码未改变) ...
     if isinstance(module, nn.Conv2d):
         if scheme == 'normal':
             nn.init.normal_(module.weight, std=.02)
@@ -188,6 +189,7 @@ def _init_weights(module, name, scheme=''):
 
 
 def act_layer(act, inplace=False, neg_slope=0.2, n_prelu=1):
+    # ... (代码未改变) ...
     act = act.lower()
     if act == 'relu':
         layer = nn.ReLU(inplace)
@@ -207,6 +209,7 @@ def act_layer(act, inplace=False, neg_slope=0.2, n_prelu=1):
 
 
 def channel_shuffle(x, groups):
+    # ... (代码未改变) ...
     batchsize, num_channels, height, width = x.data.size()
     channels_per_group = num_channels // groups
     x = x.view(batchsize, groups,
@@ -217,32 +220,86 @@ def channel_shuffle(x, groups):
 
 
 # ===================================================================
-# ===== 3. [<-- 新增] 插入 MixPool2D 模块 ============================
+# ===== 3. [<-- 新增] 插入 StochasticPool2d 模块 =====================
 # ===================================================================
-class MixPool2d(nn.Module):
+class StochasticPool2d(nn.Module):
     """
-    Learnable MixPool (2x2, stride 2)
-    alpha * MaxPool + (1 - alpha) * AvgPool
+    Stochastic Pooling (2x2, stride 2)
+    - 训练: 根据激活值概率进行多项分布采样
+    - 测试: 根据激活值概率进行加权平均
+
+    (基于 Zeiler & Fergus, 2013)
     """
 
     def __init__(self, kernel_size=2, stride=2, padding=0):
-        super(MixPool2d, self).__init__()
-        self.max_pool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding)
-        self.avg_pool = nn.AvgPool2d(kernel_size=kernel_size, stride=stride, padding=padding)
-
-        # 可学习的 alpha, 初始化为 0.0，这样 sigmoid(0.0) = 0.5，初始时混合比例为 50/50
-        # alpha 是一个标量，被所有通道共享
-        self.alpha = nn.Parameter(torch.zeros(1))
+        super(StochasticPool2d, self).__init__()
+        # 确保是 2x2, non-overlapping
+        assert kernel_size == 2 and stride == 2 and padding == 0, \
+            "此实现专用于 2x2, stride 2, non-overlapping 的随机池化"
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.eps = 1e-6  # 避免除以零
 
     def forward(self, x):
-        # 使用 sigmoid 将 alpha 约束到 (0, 1) 范围
-        alpha = torch.sigmoid(self.alpha)
+        b, c, h, w = x.shape
+        new_h, new_w = h // 2, w // 2
+        patch_size = self.kernel_size * self.kernel_size  # 4
 
-        max_out = self.max_pool(x)
-        avg_out = self.avg_pool(x)
+        # 1. Reshape, (B, C, H, W) -> (B, C, H/2*W/2, 4)
+        x_patches = x.view(b, c, new_h, self.kernel_size, new_w, self.kernel_size) \
+            .permute(0, 1, 2, 4, 3, 5).contiguous() \
+            .view(b, c, -1, patch_size)
 
-        # 混合输出
-        return alpha * max_out + (1 - alpha) * avg_out
+        # 2. 计算概率
+        # 概率必须基于非负数，所以我们使用 ReLU
+        x_patches_relu = F.relu(x_patches)
+
+        # (B, C, NumPatches, 1)
+        patch_sums = torch.sum(x_patches_relu, dim=-1, keepdim=True)
+
+        # 检查哪些 patch 的总和为 0 (或接近0)
+        # (B, C, NumPatches, 1)
+        is_zero_mask = (patch_sums <= self.eps)
+
+        # 计算概率: p_i = a_i / (sum(a_j) + eps)
+        probs = x_patches_relu / (patch_sums + self.eps)
+
+        # 对于总和为 0 的 patch, 使用均匀分布
+        # (1.0 / patch_size) = 1.0 / 4 = 0.25
+        uniform_probs = torch.full_like(probs, 1.0 / patch_size)
+
+        # 使用掩码混合
+        probs = torch.where(is_zero_mask.expand_as(probs), uniform_probs, probs)
+
+        if self.training:
+            # 3. 训练模式: 多项分布采样
+            # (B*C*NumPatches, 4)
+            probs_flat = probs.view(-1, patch_size)
+
+            # 采样索引 (B*C*NumPatches, 1)
+            # multinomial 要求概率和为 1, 我们的 probs 已经满足
+            sampled_indices = torch.multinomial(probs_flat, num_samples=1)
+
+            # 使用采样的索引从 *原始* x_patches (非 relu) 中获取值
+            x_patches_flat = x_patches.view(-1, patch_size)
+
+            # (B*C*NumPatches, 1)
+            sampled_values = x_patches_flat.gather(dim=-1, index=sampled_indices)
+
+            # Reshape 回 (B, C, H/2, W/2)
+            output = sampled_values.view(b, c, new_h, new_w)
+
+        else:
+            # 4. 评估模式: 加权平均
+            # (B, C, NumPatches)
+            # 注意: 我们用 *原始* x_patches 的值和 probs 计算加权平均
+            weighted_avg = torch.sum(x_patches * probs, dim=-1)
+
+            # Reshape 回 (B, C, H/2, W/2)
+            output = weighted_avg.view(b, c, new_h, new_w)
+
+        return output
 
 
 # ===================================================================
@@ -473,14 +530,14 @@ class MK_UNet(nn.Module):
                                           dw_parallel=True, add=True, kernel_sizes=kernel_sizes)
 
         # ===================================================================
-        # ===== [<-- 新增] 实例化 MixPool 模块 ==============================
+        # ===== [<-- 修改] 实例化 StochasticPool 模块 =======================
         # ===================================================================
-        # 我们需要在 __init__ 中定义池化层，因为它们现在是 nn.Module
-        self.pool1 = MixPool2d(kernel_size=2, stride=2)
-        self.pool2 = MixPool2d(kernel_size=2, stride=2)
-        self.pool3 = MixPool2d(kernel_size=2, stride=2)
-        self.pool4 = MixPool2d(kernel_size=2, stride=2)
-        self.pool5_bottle = MixPool2d(kernel_size=2, stride=2)
+        # 将 MixPool2d 替换为 StochasticPool2d
+        self.pool1 = StochasticPool2d(kernel_size=2, stride=2)
+        self.pool2 = StochasticPool2d(kernel_size=2, stride=2)
+        self.pool3 = StochasticPool2d(kernel_size=2, stride=2)
+        self.pool4 = StochasticPool2d(kernel_size=2, stride=2)
+        self.pool5_bottle = StochasticPool2d(kernel_size=2, stride=2)
         # ===================================================================
 
         self.AG1 = GroupedAttentionGate(F_g=channels[3], F_l=channels[3], F_int=channels[3] // 2,
@@ -523,28 +580,27 @@ class MK_UNet(nn.Module):
         B = x.shape[0]
         ### Encoder
         ### Stage 1
-
         # out = F.avg_pool2d(self.encoder1(x), 2, 2) # 原始代码
-        out = self.pool1(self.encoder1(x))  # [<-- 修改]
+        out = self.pool1(self.encoder1(x))  # [<-- 修改] (调用实例)
 
         t1 = out
         ### Stage 2
         # out = F.avg_pool2d(self.encoder2(out), 2, 2) # 原始代码
-        out = self.pool2(self.encoder2(out))  # [<-- 修改]
+        out = self.pool2(self.encoder2(out))  # [<-- 修改] (调用实例)
         t2 = out
         ### Stage 3
         # out = F.avg_pool2d(self.encoder3(out), 2, 2) # 原始代码
-        out = self.pool3(self.encoder3(out))  # [<-- 修改]
+        out = self.pool3(self.encoder3(out))  # [<-- 修改] (调用实例)
         t3 = out
 
         ### Stage 4
         # out = F.avg_pool2d(self.encoder4(out), 2, 2) # 原始代码
-        out = self.pool4(self.encoder4(out))  # [<-- 修改]
+        out = self.pool4(self.encoder4(out))  # [<-- 修改] (调用实例)
         t4 = out
 
         ### Bottleneck
         # out = F.avg_pool2d(self.encoder5(out), 2, 2) # 原始代码
-        out = self.pool5_bottle(self.encoder5(out))  # [<-- 修改]
+        out = self.pool5_bottle(self.encoder5(out))  # [<-- 修改] (调用实例)
 
         ### Stage 4
         out = self.CA1(out) * out
@@ -594,13 +650,25 @@ if __name__ == '__main__':
         model = MK_UNet(num_classes=1, in_channels=3, channels=[16, 32, 64, 96, 160], depths=[1, 1, 1, 1, 1],
                         kernel_sizes=[1, 3, 5], expansion_factor=2, gag_kernel=3).to(torch.device('cuda:0'))
 
-        flops, params = profile(model, inputs=(input,))
-        output = model(input)
+        # 确保模型处于训练模式，以测试 Stochastic Sampling
+        model.train()
+        print("--- Testing StochasticPool in Training Mode ---")
+        flops_train, params_train = profile(model, inputs=(input,))
+        output_train = model(input)
 
-        print(f"\n--- Final Model Output (with CosinConv2D and MixPool) ---")  # [<-- 修改]
+        # 切换到评估模式，以测试 Weighted Average
+        model.eval()
+        print("--- Testing StochasticPool in Eval Mode ---")
+        flops_eval, params_eval = profile(model, inputs=(input,))
+        output_eval = model(input)
+
+        print(f"\n--- Final Model Output (with CosinConv2D and StochasticPool) ---")  # [<-- 修改]
         print(f"Input shape: {input.shape}")
-        print(f"Output shape: {output[0].shape}")
-        print(f"FLOPs (G): {flops / 1e9}")
-        print(f"Params (M): {params / 1e6}")
+        print(f"Output shape (Train): {output_train[0].shape}")
+        print(f"Output shape (Eval): {output_eval[0].shape}")
+        print(f"FLOPs (G, Train): {flops_train / 1e9}")
+        print(f"Params (M, Train): {params_train / 1e6}")
+        print(f"FLOPs (G, Eval): {flops_eval / 1e9}")
+        print(f"Params (M, Eval): {params_eval / 1e6}")
     else:
         print("CUDA not available. Please run this on a machine with a GPU.")
